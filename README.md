@@ -1,6 +1,14 @@
+<a href="https://important.is"><img src="assets/banner.png" alt="Łukasz Ślusarski, founder of important.is" width="100%"></a>
+
 # Skills
 
-Agent Skills by Łukasz Ślusarski for Claude Code and other agents that read the `SKILL.md` format. Each skill is a folder in `skills/` with a `SKILL.md` and optional `references/` and `scripts/`.
+[![Book a 30 min call](https://img.shields.io/badge/Book_a_30_min_call-FF3434?style=for-the-badge&logo=caldotcom&logoColor=white)](https://cal.com/lukasz-important/spotkanie-30-minut) [![important.is](https://img.shields.io/badge/important.is-1b1b1b?style=for-the-badge)](https://important.is)
+
+Agent Skills by [Łukasz Ślusarski](https://github.com/lukasz-slusarski), founder of [important.is](https://important.is), for Claude Code and other agents that read the `SKILL.md` format.
+
+**Looking for good skills from other authors?** See [CATALOG.md](CATALOG.md): a curated list of the most useful community skills for marketing, design, office documents, websites and working with agents.
+
+Each skill here is a folder in `skills/` with a `SKILL.md` and optional `references/` and `scripts/`.
 
 ## Skills
 
@@ -27,6 +35,10 @@ npx skills add lukasz-slusarski/skills
 ```
 
 Manually: copy a skill folder to `~/.claude/skills/`.
+
+## Work with me
+
+Need help choosing or building skills for your team? [Book a 30 min call](https://cal.com/lukasz-important/spotkanie-30-minut) or visit [important.is](https://important.is).
 
 ## Disclaimer
 
