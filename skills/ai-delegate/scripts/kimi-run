@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# kimi-run: hand a task to Kimi through this skill's relay.mjs and measure the quota cost.
+# Usage: kimi-run --brief file.txt --cd /repo [--model alias] [other relay.mjs flags]
+# Refuses to start when fewer than KIMI_MIN requests (default 30) are left in the 5h window.
+# Requires: kimi (Kimi Code CLI, logged in), node, jq, python3.
+# Env: KIMI_MIN (default 30), KIMI_HOME (default ~/.kimi-code, used by kimi-limit),
+#      AI_DELEGATE_HOME (cost logs, default ~/.config/ai-delegate).
+# Cost is appended to $AI_DELEGATE_HOME/kimi-cost-log.jsonl.
+# Exit codes: 3 quota unreadable, 4 below KIMI_MIN, otherwise the relay's own code
+#             (2 usage error, 127 kimi missing, 124/other mirrored from relay.mjs).
+set -uo pipefail
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "$SELF" ]]; do t=$(readlink "$SELF"); [[ "$t" = /* ]] && SELF="$t" || SELF="$(dirname "$SELF")/$t"; done
+DIR="$(cd "$(dirname "$SELF")" && pwd)"
+STATE="${AI_DELEGATE_HOME:-$HOME/.config/ai-delegate}"
+mkdir -p "$STATE"
+RELAY="$DIR/relay.mjs"
+LOG="$STATE/kimi-cost-log.jsonl"
+MIN="${KIMI_MIN:-30}"
+
+args=("$@")
+model="kimi-code/kimi-for-coding"
+brief=""
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    --model) model="${args[$((i + 1))]}" ;;
+    --brief) brief="${args[$((i + 1))]}" ;;
+  esac
+done
+[[ " ${args[*]} " == *" --model "* ]] || args+=(--model "$model")
+
+before=$("$DIR/kimi-limit" --json) || { echo "kimi-run: could not read the quota" >&2; exit 3; }
+rem_before=$(jq -r .remaining <<<"$before")
+if (( rem_before < MIN )); then
+  echo "kimi-run: $rem_before requests left (< $MIN), reset $(jq -r .reset <<<"$before"). Not dispatching." >&2
+  exit 4
+fi
+
+out=$(node "$RELAY" "${args[@]}" 2>&1)
+code=$?
+echo "$out"
+
+after=$("$DIR/kimi-limit" --json) || after='{}'
+result=$(grep -oE '^result: .*result\.json' <<<"$out" | sed 's/^result: //')
+status=$(jq -r '.status // "?"' "$result" 2>/dev/null || echo "?")
+used=$(( rem_before - $(jq -r '.remaining // 0' <<<"$after") ))
+month=$(jq -rn --argjson a "$before" --argjson b "$after" '(($b.month_pct // 0) - $a.month_pct) * 100 | round / 100')
+title=$(head -c 80 "${brief:-/dev/null}" 2>/dev/null | tr '\n' ' ')
+
+jq -cn --arg ts "$(date -u +%FT%TZ)" --arg model "$model" --arg status "$status" --arg title "$title" \
+  --argjson used "$used" --argjson month "$month" --argjson left "$(jq -r '.remaining // 0' <<<"$after")" \
+  '{ts:$ts, model:$model, status:$status, requests:$used, month_pct:$month, left:$left, brief:$title}' >>"$LOG"
+echo "kimi-run: cost $used requests, +$month% of the month, $(jq -r '.remaining // "?"' <<<"$after") left (model $model)"
+exit $code

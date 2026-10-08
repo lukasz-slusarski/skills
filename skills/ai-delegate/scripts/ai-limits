@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+# One table: how much is left in each AI subscription. Basis for deciding which executor gets a task.
+# Read-only. Codex comes from the latest local session file, the rest from agy-limit / glm-limit / kimi-limit
+# (those sit next to this script). Sections whose tool or login is missing print "no data" and are skipped.
+import json, os, glob, subprocess, sys, time, datetime as dt
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+def age(ts):
+    m = int((time.time() - ts) / 60)
+    return f"{m} min ago" if m < 120 else f"{m // 60} h ago"
+
+def reset(iso_or_ts):
+    if not iso_or_ts:
+        return ""
+    t = dt.datetime.fromtimestamp(iso_or_ts) if isinstance(iso_or_ts, (int, float)) \
+        else dt.datetime.fromisoformat(iso_or_ts).astimezone()
+    return t.strftime("reset %d.%m %H:%M")
+
+print("CODEX (left: 5h window / week), optional")
+try:
+    f = max(glob.glob(os.path.expanduser("~/.codex/sessions/**/*.jsonl"), recursive=True), key=os.path.getmtime)
+    rl = None
+    for line in open(f, errors="ignore"):
+        if '"rate_limits"' in line:
+            r = json.loads(line)
+            rl = (r.get("payload") or {}).get("rate_limits") or rl
+    if rl:
+        print(f"  {100 - rl['primary']['used_percent']:.0f}% / {100 - rl['secondary']['used_percent']:.0f}%"
+              f"   {reset(rl['secondary'].get('resets_at'))}  (data {age(os.path.getmtime(f))})")
+    else:
+        print("  no rate_limits in the latest session")
+except Exception as e:
+    print("  no data:", e)
+
+for name, cmd in [("ANTIGRAVITY", "agy-limit"), ("GLM", "glm-limit"), ("KIMI", "kimi-limit")]:
+    print(name)
+    try:
+        out = subprocess.run([os.path.join(HERE, cmd)], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        for l in (out.stdout + out.stderr).strip().splitlines():
+            print("  " + l)
+    except Exception as e:
+        print("  no data:", e)

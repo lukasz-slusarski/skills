@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# glm-run: hand a task to GLM (headless Claude Code on the Z.ai GLM Coding Plan) and measure the quota cost.
+# Same briefs and same worker rules as kimi-run and agy-run, so the executors are comparable.
+# Usage: glm-run --brief file.txt --cd /repo [--model glm-5.3|glm-5.3-flash] [--timeout seconds, default 1800]
+#        [--resume <session_id> | --resume-last]   (delta brief into an earlier session; id is in the log and on stdout)
+#        [--mode impl|scout|tests]   impl: writes code (default); scout: read-only tools, answers a question;
+#                                    tests: runs the commands from the brief, no edits (tree change = exit 5)
+# Requires: claude (Claude Code), jq, perl, git, and GLM_API_KEY exported in the environment.
+# Env: GLM_API_KEY (required), GLM_MAX_PCT (default 70), GLM_SETTLE (default 30 s),
+#      AI_DELEGATE_HOME (cost logs, default ~/.config/ai-delegate),
+#      AI_DELEGATE_RULES_DIR (worker/scout/tests rule files, default: this script's directory).
+# Cost is appended to $AI_DELEGATE_HOME/glm-cost-log.jsonl.
+# Exit codes: 2 usage error, 3 no key or quota unreadable, 4 5h window above GLM_MAX_PCT,
+#             5 scout/tests mode changed the working tree, 142 timeout (SIGALRM).
+set -uo pipefail
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "$SELF" ]]; do t=$(readlink "$SELF"); [[ "$t" = /* ]] && SELF="$t" || SELF="$(dirname "$SELF")/$t"; done
+DIR="$(cd "$(dirname "$SELF")" && pwd)"
+STATE="${AI_DELEGATE_HOME:-$HOME/.config/ai-delegate}"
+mkdir -p "$STATE"
+LOG="$STATE/glm-cost-log.jsonl"
+RULES_DIR="${AI_DELEGATE_RULES_DIR:-$DIR}"
+RULES="$RULES_DIR/worker-rules.md"
+MAX_PCT="${GLM_MAX_PCT:-70}"   # do not dispatch when the 5h window is already used above this percentage
+model="glm-5.3" brief="" cd="$PWD" timeout=1800 resume=() mode=impl
+while (($#)); do
+  case "$1" in
+    --brief) brief="$2"; shift 2 ;;
+    --cd) cd="$2"; shift 2 ;;
+    --model) model="$2"; shift 2 ;;
+    --timeout) timeout="$2"; shift 2 ;;
+    --mode) mode="$2"; shift 2 ;;
+    --resume) resume=(--resume "$2"); shift 2 ;;
+    --resume-last) id=$(tail -1 "$LOG" 2>/dev/null | jq -r '.session // empty'); [[ -n "$id" ]] || { echo "glm-run: no session in the log" >&2; exit 2; }; resume=(--resume "$id"); shift ;;
+    *) echo "glm-run: unknown flag $1" >&2; exit 2 ;;
+  esac
+done
+[[ -f "$brief" ]] || { echo "glm-run: missing --brief" >&2; exit 2; }
+case "$mode" in
+  impl)  tools=(--dangerously-skip-permissions) ;;
+  # Claude Code 2.1.283 has no separate Grep/Glob tools, search goes through Bash: only read commands, everything else is denied (dontAsk)
+  scout) RULES="$RULES_DIR/scout-rules.md"; tools=(--tools "Read,Bash" --permission-mode dontAsk --allowedTools
+           "Read" "Bash(rg:*)" "Bash(grep:*)" "Bash(ls:*)" "Bash(head:*)" "Bash(tail:*)" "Bash(wc:*)" "Bash(cat:*)"
+           "Bash(git log:*)" "Bash(git show:*)" "Bash(git diff:*)" "Bash(git status:*)" "Bash(git grep:*)" "Bash(git ls-files:*)") ;;
+  # tests need arbitrary project commands; the protection is comparing the tree before and after (exit 5)
+  tests) RULES="$RULES_DIR/tests-rules.md"; tools=(--tools "Bash,Read" --dangerously-skip-permissions) ;;
+  *) echo "glm-run: unknown mode $mode (impl|scout|tests)" >&2; exit 2 ;;
+esac
+[[ -f "$RULES" ]] || { echo "glm-run: rules file not found: $RULES" >&2; exit 2; }
+hasher() { shasum 2>/dev/null || sha1sum; }
+# test-tool caches do not count as a change
+tree() { git -C "$cd" status --porcelain 2>/dev/null | grep -vE '__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.cache/|coverage|\.nyc_output|\.phpunit'; git -C "$cd" diff 2>/dev/null | hasher; }
+tree_before=$(tree)
+[[ -n "${GLM_API_KEY:-}" ]] || { echo "glm-run: GLM_API_KEY is not set (export it in your shell profile)" >&2; exit 3; }
+export GLM_API_KEY
+
+before=$("$DIR/glm-limit" --json) || { echo "glm-run: could not read the quota" >&2; exit 3; }
+pct_before=$(jq -r .pct_5h <<<"$before")
+if (( $(printf '%.0f' "$pct_before") > MAX_PCT )); then
+  echo "glm-run: 5h window is $pct_before% used (> $MAX_PCT%). Not dispatching." >&2; exit 4
+fi
+
+run=$(mktemp -d "${TMPDIR:-/tmp}/glm-run.XXXXXX")
+start=$(date +%s)
+# --bare: no CLAUDE.md, hooks, plugins or memory (fewer tokens, a clean implementer).
+# Z.ai authorizes with the Authorization header (ANTHROPIC_AUTH_TOKEN) while --bare reads only ANTHROPIC_API_KEY
+# or apiKeyHelper; the helper sends the key in both headers, so we go through it (glm-key-helper.sh echoes $GLM_API_KEY).
+settings=$(jq -cn --arg h "$DIR/glm-key-helper.sh" '{apiKeyHelper:$h}')
+( cd "$cd" && env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic" \
+  ANTHROPIC_MODEL="$model" ANTHROPIC_DEFAULT_HAIKU_MODEL="glm-5.3-flash" API_TIMEOUT_MS=3000000 \
+  perl -e 'alarm shift; exec @ARGV' "$timeout" claude --bare -p --output-format json \
+    --settings "$settings" \
+    --strict-mcp-config --append-system-prompt-file "$RULES" ${resume[@]+"${resume[@]}"} ${tools[@]+"${tools[@]}"} <"$brief" >"$run/result.json" 2>"$run/stderr.txt" )
+code=$?
+secs=$(( $(date +%s) - start ))
+
+jq -r '.result // "(no report)"' "$run/result.json" 2>/dev/null || cat "$run/stderr.txt"
+echo; echo "touched files:"; git -C "$cd" status --porcelain
+if [[ "$mode" != impl && "$(tree)" != "$tree_before" ]]; then
+  echo "glm-run: WARNING mode $mode changed the working tree (compare git status/diff)" >&2; code=5
+fi
+
+sleep "${GLM_SETTLE:-30}"   # the Z.ai usage counter catches up with a delay
+after=$("$DIR/glm-limit" --json) || after='{}'
+d5=$(jq -rn --argjson a "$before" --argjson b "$after" '(($b.pct_5h // 0) - $a.pct_5h) * 100 | round / 100')
+dw=$(jq -rn --argjson a "$before" --argjson b "$after" '(($b.pct_week // 0) - $a.pct_week) * 100 | round / 100')
+cred=$(jq -rn --argjson a "$before" --argjson b "$after" '(($b.cred_5h // 0) - $a.cred_5h) * 100 | round / 100')
+turns=$(jq -r '.num_turns // 0' "$run/result.json" 2>/dev/null || echo 0)
+session=$(jq -r '.session_id // ""' "$run/result.json" 2>/dev/null)
+title=$(head -c 80 "$brief" | tr '\n' ' ')
+jq -cn --arg ts "$(date -u +%FT%TZ)" --arg model "$model" --arg mode "$mode" --argjson code "$code" --argjson secs "$secs" \
+  --argjson turns "$turns" --argjson cred "$cred" --argjson p5 "$d5" --argjson pw "$dw" --arg title "$title" --arg dir "$run" --arg session "$session" \
+  '{ts:$ts, model:$model, mode:$mode, exit:$code, secs:$secs, turns:$turns, credits:$cred, pct_5h:$p5, pct_week:$pw, brief:$title, run:$dir, session:$session}' >>"$LOG"
+echo "result: $run/result.json  session: $session"
+echo "glm-run: cost $cred credits, +$d5% of the 5h window, +$dw% of the week, $turns turns, ${secs}s (model $model)"
+exit $code

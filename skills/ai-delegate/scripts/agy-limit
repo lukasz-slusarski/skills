@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+# Antigravity quota (Google AI plan): two groups, Gemini and Claude/GPT, each with a 5h and a weekly window.
+# Source: `agy -p /usage --output-format json` (the slash command works in print mode and costs 0 tokens).
+# --json: {"gemini": {"5h": frac, "weekly": frac, "reset_5h": iso, ...}, "3p": {...}} for scripts.
+# "3p" is the Claude/GPT group; fractions are the REMAINING share of the window (1.0 = untouched).
+import json, subprocess, sys, time, datetime as dt
+# /usage occasionally returns a reply without the "command" section (seen during a benchmark in Sept 2026),
+# so we try three times before deciding the quota cannot be read.
+d, err, out = None, None, ""
+for attempt in range(3):
+    try:
+        out = subprocess.run(["agy", "-p", "/usage", "--output-format", "json"], capture_output=True,
+                             text=True, timeout=60, stdin=subprocess.DEVNULL).stdout
+        d = json.loads(out[out.index("{"):])
+        d["command"]["data"]["groups"]
+        break
+    except Exception as e:
+        d, err = None, f"{type(e).__name__}: {e}; reply: {out[:200]!r}"
+        time.sleep(3)
+if d is None:
+    sys.exit(f"agy-limit: could not read the quota ({err}). Logged in? Run `agy` in a terminal.")
+res = {}
+for g in d["command"]["data"]["groups"]:
+    key = "gemini" if g["name"].startswith("Gemini") else "3p"
+    for b in g["buckets"]:
+        res.setdefault(key, {})[b["window"]] = b["remaining_fraction"]
+        res[key]["reset_" + b["window"]] = b["reset_time"]
+if "--json" in sys.argv:
+    print(json.dumps(res)); sys.exit(0)
+names = {"gemini": "Gemini", "3p": "Claude and GPT"}
+for key, v in res.items():
+    for w, label in (("5h", "5h window"), ("weekly", "week")):
+        r = dt.datetime.fromisoformat(v["reset_" + w].replace("Z", "+00:00")).astimezone().strftime("%d.%m %H:%M")
+        print(f"{names[key]:15} {label:10} {v[w]*100:5.1f}% left   reset {r}")

@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# agy-run: hand a task to Antigravity CLI (agy, Google AI plan) and measure the quota cost.
+# Counterpart of glm-run: same briefs, same worker rules, same modes.
+# Usage: agy-run --brief file.txt --cd /repo [--model slug] [--timeout seconds, default 1800]
+#        [--mode impl|scout|tests] [--resume <conversation_id> | --resume-last]
+# Models: `agy models` (the list changes with Antigravity releases). Default claude-sonnet-5-5-medium
+# (Claude/GPT group), overridable with AGY_MODEL; gemini-* models draw on a separate quota group.
+# Requires: agy (logged in), jq, perl, git, python3 (for agy-limit).
+# Env: AGY_MODEL, AGY_MIN_PCT (default 30), AI_DELEGATE_HOME (cost logs, default ~/.config/ai-delegate),
+#      AI_DELEGATE_RULES_DIR (rule files, default: this script's directory).
+# Cost is appended to $AI_DELEGATE_HOME/agy-cost-log.jsonl.
+# Exit codes: 1 agy reported an error (e.g. unknown model), 2 usage error, 3 quota unreadable (usually logged out),
+#             4 less than AGY_MIN_PCT left in the group's 5h window, 5 scout/tests mode changed the tree, 142 timeout.
+set -uo pipefail
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "$SELF" ]]; do t=$(readlink "$SELF"); [[ "$t" = /* ]] && SELF="$t" || SELF="$(dirname "$SELF")/$t"; done
+DIR="$(cd "$(dirname "$SELF")" && pwd)"
+STATE="${AI_DELEGATE_HOME:-$HOME/.config/ai-delegate}"
+mkdir -p "$STATE"
+LOG="$STATE/agy-cost-log.jsonl"
+RULES_DIR="${AI_DELEGATE_RULES_DIR:-$DIR}"
+MIN_PCT="${AGY_MIN_PCT:-30}"   # do not dispatch when less than this percentage is left in the group's 5h window
+model="${AGY_MODEL:-claude-sonnet-5-5-medium}" brief="" cd="$PWD" timeout=1800 mode=impl resume=()
+while (($#)); do
+  case "$1" in
+    --brief) brief="$2"; shift 2 ;;
+    --cd) cd="$2"; shift 2 ;;
+    --model) model="$2"; shift 2 ;;
+    --timeout) timeout="$2"; shift 2 ;;
+    --mode) mode="$2"; shift 2 ;;
+    --resume) resume=(--conversation "$2"); shift 2 ;;
+    --resume-last) id=$(tail -1 "$LOG" 2>/dev/null | jq -r '.session // empty'); [[ -n "$id" ]] || { echo "agy-run: no session in the log" >&2; exit 2; }; resume=(--conversation "$id"); shift ;;
+    *) echo "agy-run: unknown flag $1" >&2; exit 2 ;;
+  esac
+done
+[[ -f "$brief" ]] || { echo "agy-run: missing --brief" >&2; exit 2; }
+case "$mode" in
+  impl)  RULES="$RULES_DIR/worker-rules.md"; perm=(--dangerously-skip-permissions) ;;
+  scout) RULES="$RULES_DIR/scout-rules.md"; perm=(--mode plan) ;;
+  # tests need arbitrary project commands; the protection is comparing the tree before and after (exit 5)
+  tests) RULES="$RULES_DIR/tests-rules.md"; perm=(--dangerously-skip-permissions) ;;
+  *) echo "agy-run: unknown mode $mode (impl|scout|tests)" >&2; exit 2 ;;
+esac
+[[ -f "$RULES" ]] || { echo "agy-run: rules file not found: $RULES" >&2; exit 2; }
+group=3p; [[ "$model" == gemini-* ]] && group=gemini
+
+before=$("$DIR/agy-limit" --json) || { echo "agy-run: could not read the quota" >&2; exit 3; }
+left=$(jq -r ".\"$group\".\"5h\" * 100 | floor" <<<"$before")
+if (( left < MIN_PCT )); then
+  echo "agy-run: $left% left in the 5h window of group $group (< $MIN_PCT%), reset $(jq -r ".\"$group\".reset_5h" <<<"$before"). Not dispatching." >&2
+  exit 4
+fi
+
+hasher() { shasum 2>/dev/null || sha1sum; }
+tree() { git -C "$cd" status --porcelain 2>/dev/null | grep -vE '__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.cache/|coverage|\.nyc_output|\.phpunit'; git -C "$cd" diff 2>/dev/null | hasher; }
+tree_before=$(tree)
+run=$(mktemp -d "${TMPDIR:-/tmp}/agy-run.XXXXXX")
+# agy has no flag for an extra system prompt, so the rules are prepended to the prompt
+prompt="$(cat "$RULES")
+
+---
+
+$(cat "$brief")"
+start=$(date +%s)
+( cd "$cd" && perl -e 'alarm shift; exec @ARGV' "$timeout" agy -p "$prompt" --model "$model" --output-format json \
+    --disable-slash-commands "${perm[@]}" ${resume[@]+"${resume[@]}"} </dev/null >"$run/result.json" 2>"$run/stderr.txt" )
+code=$?
+secs=$(( $(date +%s) - start ))
+if [[ "$(jq -r '.status // ""' "$run/result.json" 2>/dev/null)" != SUCCESS ]]; then
+  ((code == 0)) && code=1
+  # an agy error (e.g. unknown model) sits in .error while .response is empty: show it instead of faking an empty report
+  err=$(jq -r '.error // empty' "$run/result.json" 2>/dev/null)
+  echo "agy-run: agy finished with an error: ${err:-$(tail -5 "$run/stderr.txt")}" >&2
+  [[ "$err" == *"not recognized as a known model"* ]] && echo "agy-run: check the current model names: agy models" >&2
+fi
+
+jq -r 'if (.response // "") == "" then "(no report)" else .response end' "$run/result.json" 2>/dev/null || cat "$run/stderr.txt"
+echo; echo "touched files:"; git -C "$cd" status --porcelain
+if [[ "$mode" != impl && "$(tree)" != "$tree_before" ]]; then
+  echo "agy-run: WARNING mode $mode changed the working tree (compare git status/diff)" >&2; code=5
+fi
+
+after=$("$DIR/agy-limit" --json) || after='{}'
+d5=$(jq -rn --argjson a "$before" --argjson b "$after" "((\$a.\"$group\".\"5h\" - (\$b.\"$group\".\"5h\" // \$a.\"$group\".\"5h\")) * 10000 | round) / 100")
+dw=$(jq -rn --argjson a "$before" --argjson b "$after" "((\$a.\"$group\".weekly - (\$b.\"$group\".weekly // \$a.\"$group\".weekly)) * 10000 | round) / 100")
+session=$(jq -r '.conversation_id // ""' "$run/result.json" 2>/dev/null)
+usage=$(jq -c '.usage // {}' "$run/result.json" 2>/dev/null || echo '{}')
+turns=$(jq -r '.num_turns // 0' "$run/result.json" 2>/dev/null || echo 0)
+title=$(head -c 80 "$brief" | tr '\n' ' ')
+jq -cn --arg ts "$(date -u +%FT%TZ)" --arg model "$model" --arg mode "$mode" --arg group "$group" --argjson code "$code" \
+  --argjson secs "$secs" --argjson turns "$turns" --argjson usage "${usage:-{\}}" --argjson p5 "$d5" --argjson pw "$dw" \
+  --arg title "$title" --arg dir "$run" --arg session "$session" --arg cwd "$(cd "$cd" && pwd -P)" \
+  '{ts:$ts, model:$model, mode:$mode, group:$group, exit:$code, secs:$secs, turns:$turns, usage:$usage, pct_5h:$p5, pct_week:$pw, cwd:$cwd, brief:$title, run:$dir, session:$session}' >>"$LOG"
+echo "result: $run/result.json  session: $session"
+echo "agy-run: +$d5% of the 5h window and +$dw% of the week for group $group, $(jq -r '.total_tokens // 0' <<<"$usage") tokens, $turns turns, ${secs}s (model $model)"
+exit $code

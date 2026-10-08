@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+# GLM Coding Plan quota (GET api.z.ai/api/monitor/usage/quota/limit). Key: GLM_API_KEY environment variable.
+# --json: {"pct_5h", "pct_week", "reset_5h", "cred_5h", "cred_week"} for scripts. --raw: raw API response.
+import json, os, sys, urllib.error, urllib.request, datetime as dt
+key = os.environ.get("GLM_API_KEY")
+if not key:
+    sys.exit("GLM_API_KEY is not set (export it in your shell profile)")
+d, err = None, None
+for auth in (key, f"Bearer {key}"):
+    try:
+        req = urllib.request.Request("https://api.z.ai/api/monitor/usage/quota/limit",
+                                     headers={"Authorization": auth, "User-Agent": "curl/8.7.1"})
+        d = json.load(urllib.request.urlopen(req, timeout=20)); break
+    except urllib.error.HTTPError as e:
+        err = e.code
+if d is None:
+    sys.exit(f"Error {err} while reading the GLM quota")
+data = d.get("data", d)
+win = {3: "5h window", 6: "Week"}
+out = {}
+for l in data.get("limits", []):
+    name = win.get(l.get("unit"), f"unit {l.get('unit')}")
+    pct = float(l.get("percentage", 0))
+    reset = l.get("nextResetTime")
+    r = dt.datetime.fromtimestamp(reset / 1000).strftime("%d.%m %H:%M") if reset else "?"
+    out[l.get("unit")] = (pct, reset, float(l.get("usage", 0)) - float(l.get("remaining", l.get("usage", 0))))
+    if "--json" not in sys.argv:
+        print(f"{name:10} used {pct:5.1f}%   ({l.get('remaining', '?')}/{l.get('usage', '?')} credits left)   reset {r}")
+if "--json" in sys.argv:
+    z = (0, None, 0)
+    print(json.dumps({"pct_5h": out.get(3, z)[0], "pct_week": out.get(6, z)[0], "reset_5h": out.get(3, z)[1],
+                      "cred_5h": out.get(3, z)[2], "cred_week": out.get(6, z)[2]}))
+elif "--raw" in sys.argv:
+    print(json.dumps(d, indent=1))

@@ -1,0 +1,22 @@
+{
+  "name": "lukasz-slusarski-skills",
+  "description": "Agent Skills by Łukasz Ślusarski",
+  "owner": {
+    "name": "Łukasz Ślusarski",
+    "url": "https://github.com/lukasz-slusarski"
+  },
+  "plugins": [
+    {
+      "name": "lukasz-skills",
+      "description": "AI content labeling (EU AI Act Art. 50), AI routing and delegation, macOS clipboard",
+      "source": "./",
+      "license": "MIT",
+      "keywords": [
+        "agent-skills",
+        "ai-act",
+        "delegation",
+        "claude-code"
+      ]
+    }
+  ]
+}
